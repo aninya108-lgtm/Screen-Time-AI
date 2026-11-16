@@ -7,9 +7,12 @@ Optional AI replies: set the ANTHROPIC_API_KEY environment variable. Without it,
 falls back to a simpler built-in reply. Put config.toml in a ".streamlit" folder next to
 this file so the beige and green theme applies to every widget.
 """
+import base64
 import difflib
 import html
+import io
 import json
+import math
 import os
 import random
 import re
@@ -788,25 +791,39 @@ def in_window(n, start_min, length):
     return ((n.hour * 60 + n.minute) - start_min) % 1440 < length
 
 
+def habit_hours(rep, weekday, threshold, gap=3, cap=4):
+    """Which hours of a weekday the agent nudges: hours the model is confident about, at least `gap` hours
+    apart and at most `cap` a day, so the agent never pings every hour."""
+    hours, last = [], -99
+    for h in range(24):
+        slot = rep["forecast"].get((weekday, h))
+        if slot and slot[0] >= threshold and h - last >= gap:
+            hours.append(h)
+            last = h
+            if len(hours) == cap:
+                break
+    return hours
+
+
 def due_moment(n, data):
     """Should the agent check in at time n? Returns (kind, app) or None.
-    First 42 days: a mindful check-in an hour after waking up, and another before bed.
-    After that: only when the model is at least 60% sure an app is about to be used, and only
-    once its measured accuracy is at least 80%."""
+    First 42 days: a mindful check-in an hour after waking up, and another before bed, while it learns.
+    After that: a nudge shortly before the hours the model is at least 60% sure you will pick up an app
+    (at most 4 a day, at least 3 hours apart). Only if the model has no hour it is confident about does the
+    agent fall back to the wake-up and bedtime check-ins."""
     p = data["profile"]
     learning = day_number(data) < LEARNING_DAYS
-    if learning or KEEP_ROUTINE_NUDGES:
+    rep = None if learning else get_model(p)
+    if learning or KEEP_ROUTINE_NUDGES or not rep["ready"]:
         if in_window(n, p["wake"] * 60 + 60, 30):          # an hour after waking up
             return "morning", None
         if in_window(n, p["bed"] * 60 - 30, 30):           # the half hour before bed
             return "bed", None
-    if not learning and n.minute >= 55:
+    if rep and rep["ready"] and n.minute >= 55:
         nh = (n.hour + 1) % 24
         nd = (n.weekday() + 1) % 7 if nh == 0 else n.weekday()
-        rep = get_model(p)
-        slot = rep["forecast"].get((nd, nh))
-        if rep["ready"] and slot and slot[0] >= mt.effective_threshold(rep["t_star"], data["threshold"]):
-            return "habit", slot[1]
+        if nh in habit_hours(rep, nd, mt.effective_threshold(rep["t_star"], data["threshold"])):
+            return "habit", rep["forecast"][(nd, nh)][1]
     return None
 
 
@@ -1229,6 +1246,36 @@ def clock_corner():
                 f'<div class="nxt">{text}</div>{jump}</div>', unsafe_allow_html=True)
 
 
+def model_report(rep):
+    """One honest paragraph about how well the model did on days it had not seen."""
+    txt = (f"Tested by predicting each next week from the weeks before it: accuracy {rep['accuracy']:.0%} "
+           f"(goal {mt.MIN_ACCURACY:.0%}). For comparison, always guessing 'no use' scores "
+           f"{rep['baseline_accuracy']:.0%} and 'same as last week' scores {rep['naive_accuracy']:.0%}. "
+           f"When it was at least {rep['t_star']:.0%} sure, it was right {rep['precision']:.0%} of the time "
+           f"and caught {rep['recall']:.0%} of the hours an app was really used. ")
+    if not rep["ready"]:
+        return txt + "It has no hours it is confident enough about, so it keeps to wake-up and bedtime check-ins."
+    return txt + ("Habit notifications are on." if rep["meets_goal"] else
+                  "Habit notifications are on, but overall accuracy is below the goal, so treat them as gentle nudges.")
+
+
+def find_predictable():
+    """Demo helper: try random teens until the agent can predict one (at most 8 tries)."""
+    p = S.data["profile"]
+    today = datetime.now().date().isoformat()
+    seed = S.sim_seed
+    for _ in range(8):
+        seed = random.randrange(2 ** 31)
+        rep = train_model(p["ss"], p["se"], p["bed"], p["wake"], seed, today)
+        if rep["ready"]:
+            S.sim_seed, S.logged_seed = seed, None
+            S.agent_text = S.agent_report = None
+            return f"Found a teen the agent can predict (accuracy {rep['accuracy']:.0%})."
+    S.sim_seed, S.logged_seed = seed, None
+    S.agent_text = S.agent_report = None
+    return "None of 8 random teens were regular enough to predict. Real people vary like this too. Try again."
+
+
 def new_sim():
     S.sim_seed, S.logged_seed = random.randrange(2 ** 31), None
     S.agent_text = S.agent_report = None
@@ -1256,10 +1303,19 @@ def judge_tool(p):
     """Random, schedule-based screen time, next to what the agent found. For judges."""
     usage, rules = get_usage(p)
     with st.expander("Judge tool: simulated screen time", expanded=True):
-        st.caption(f"Random every time the site opens, built from this schedule: school {HOURS[p['ss']]} to "
-                   f"{HOURS[p['se']]}, wake {HOURS[p['wake']]}, bed {HOURS[p['bed']]}. It is saved in the "
-                   "local SQLite file and the agent learns from it.")
-        st.button("Generate a new random week", key="judge_new", on_click=new_sim)
+        st.caption(f"A different made-up teenager every time the site opens, built around this schedule: school "
+                   f"{HOURS[p['ss']]} to {HOURS[p['se']]}, wake {HOURS[p['wake']]}, bed {HOURS[p['bed']]}. "
+                   "Some are very regular, some are not. Every day differs (heavy and light days, sick days, "
+                   "practice days, long binges), habit times wobble, and use drifts over the weeks. "
+                   "It is saved in the local SQLite file and the agent learns from it.")
+        c_a, c_b = st.columns(2)
+        c_a.button("New random teen", key="judge_new", on_click=new_sim)
+        if c_b.button("Find a predictable teen", key="judge_find"):
+            with st.spinner("Trying random teens (a few seconds each)…"):
+                S.find_msg = find_predictable()
+            st.rerun()
+        if S.get("find_msg"):
+            st.caption(S.find_msg)
         daily = usage.groupby("date")["minutes"].sum()
         c1, c2 = st.columns(2)
         c1.metric("Per day (7 days)", f"{daily.tail(7).mean() / 60:.1f} h")
@@ -1274,16 +1330,15 @@ def judge_tool(p):
         st.dataframe(usage[usage["date"].isin(last7)].pivot_table(
             index="date", columns="app", values="minutes", aggfunc="sum", fill_value=0))
 
-        st.write("**Answer key: habits planted in this data**")
+        st.write("**Answer key: habits that showed up in this teen's data**")
         for r in rules:
             st.markdown(f"• **{r['app']}** around **{HOURS[r['hour']]}** {r['when']} "
-                        f"({r['chance']:.0%} of the time)")
+                        f"(on {r['chance']:.0%} of those days)")
         rep = get_model(p)
         st.write("**Patterns the agent found**")
         for sentence in top_patterns(rep["forecast"], eff_threshold(rep), limit=8):
             st.markdown("• " + sentence)
-        st.caption(f"Tested on hours it had not trained on: accuracy {rep['accuracy']:.0%}. When it was at least "
-                   f"{rep['t_star']:.0%} sure of a habit, it was right {rep['precision']:.0%} of the time.")
+        st.caption(model_report(rep))
 
         if st.button("Ask the agent to explain my patterns", key="judge_explain"):
             with st.spinner("Running the pandas tool…"):
@@ -1343,17 +1398,13 @@ def sidebar():
             st.button("Reset everything", key="demo_reset", on_click=reset_all)
             if st.checkbox("Show model insights", key="demo_insights"):
                 rep = get_model(p)
-                st.caption(f"Accuracy {rep['accuracy']:.0%} (goal: {mt.MIN_ACCURACY:.0%}). "
-                           f"When it was at least {rep['t_star']:.0%} sure, it was right {rep['precision']:.0%} "
-                           f"of the time and caught {rep['recall']:.0%} of the hours an app was really used. "
-                           + ("Habit notifications are on." if rep["ready"]
-                              else "Not accurate enough yet, so only mindful check-ins are sent."))
+                st.caption(model_report(rep))
                 st.write("**Feature importance**")
                 ranked = pd.Series(rep["importances"]).sort_values(ascending=False)
                 st.bar_chart(pd.DataFrame({"importance": ranked}), color="#2F4F3A")
                 top3 = ", ".join(f"{n} ({v:.0%})" for n, v in ranked.head(3).items())
-                st.caption(f"Strongest predictors: {top3}. The data is simulated from schedule-based "
-                           "habits, so this shows the model recovering those patterns.")
+                st.caption(f"Strongest predictors: {top3}. The data is simulated, so this shows the model "
+                           "recovering the patterns in made-up teens, not in real ones.")
         judge_tool(p)
 
 
@@ -1456,12 +1507,121 @@ def trophy_room():
         text = f"I just earned the “{name}” badge on Mindful Scroll {icon} ({desc})."
         if APP_URL:
             text += " " + APP_URL
-        st.code(text, language=None)        # tap the copy icon, then paste it to a friend
+        png = badge_png(icon, name, desc)
+        st.image(png, width=320)
+        st.code(text, language=None)        # tap the copy icon to copy the message
+        fname = "mindful-scroll-" + re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") + ".png"
+        share_badge_button(png, text, fname)
+        st.download_button("Save the picture", png, file_name=fname, mime="image/png", key="badge_dl")
         q = urllib.parse.quote(text)
-        st.markdown(f"[Share on WhatsApp](https://wa.me/?text={q}) · "
-                    f"[Share by email](mailto:?subject=My%20Mindful%20Scroll%20badge&body={q})")
-        st.caption("This shares only the badge name, nothing about your habits or data.")
+        st.markdown(f"Message only: [WhatsApp](https://wa.me/?text={q}) · "
+                    f"[email](mailto:?subject=My%20Mindful%20Scroll%20badge&body={q})")
+        st.caption("This shares only the badge picture and name, nothing about your habits or data.")
     st.button("Back home", key="big_yes", on_click=go_page, args=("home",))
+
+
+def badge_png(icon, name, desc):
+    """A picture of the badge with its message, made with Pillow (no emoji font needed)."""
+    from PIL import Image, ImageDraw, ImageFont
+    W = H = 1080
+    img = Image.new("RGB", (W, H), "#F6F0E4")
+    d = ImageDraw.Draw(img)
+
+    def font(size, bold=False):
+        names = (["Helvetica.ttc", "Arial Bold.ttf", "DejaVuSans-Bold.ttf", "Poppins-Bold.ttf"] if bold else
+                 ["Helvetica.ttc", "Arial.ttf", "DejaVuSans.ttf", "Poppins-Regular.ttf"])
+        for nm in names:
+            for root in ("", "/System/Library/Fonts/", "/Library/Fonts/", "/usr/share/fonts/truetype/dejavu/",
+                         "/usr/share/fonts/truetype/google-fonts/", "C:/Windows/Fonts/"):
+                try:
+                    return ImageFont.truetype(root + nm, size)
+                except Exception:
+                    continue
+        return ImageFont.load_default(size)
+
+    def centered(text, y, f, fill):
+        d.text(((W - d.textlength(text, font=f)) / 2, y), text, font=f, fill=fill)
+
+    def wrapped(text, y, f, fill, max_w, gap):
+        line, lines = "", []
+        for word in text.split():
+            test = (line + " " + word).strip()
+            if d.textlength(test, font=f) <= max_w:
+                line = test
+            else:
+                lines.append(line)
+                line = word
+        lines.append(line)
+        for ln in lines:
+            centered(ln, y, f, fill)
+            y += gap
+        return y
+
+    d.rounded_rectangle((36, 36, W - 36, H - 36), radius=56, fill="#FFFDF7", outline="#2F4F3A", width=8)
+    cx, cy, r = W // 2, 330, 210
+    d.polygon([(cx - 90, cy + 120), (cx - 165, cy + 240), (cx - 100, cy + 222), (cx - 50, cy + 255),
+               (cx + 10, cy + 150)], fill="#7FA68A")
+    d.polygon([(cx + 90, cy + 120), (cx + 165, cy + 240), (cx + 100, cy + 222), (cx + 50, cy + 255),
+               (cx - 10, cy + 150)], fill="#5E8D6C")
+    for rad, col in ((r, "#C9A24A"), (r - 22, "#F2D98A"), (r - 48, "#2F4F3A"), (r - 66, "#3F6B50")):
+        d.ellipse((cx - rad, cy - rad, cx + rad, cy + rad), fill=col)
+    drawn = False
+    for path in ("/System/Library/Fonts/Apple Color Emoji.ttc", "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
+                 "C:/Windows/Fonts/seguiemj.ttf"):
+        try:
+            layer = Image.new("RGBA", (260, 260), (0, 0, 0, 0))
+            ImageDraw.Draw(layer).text((10, 0), icon, font=ImageFont.truetype(path, 109 if "Noto" in path or
+                                                                              "Apple" in path else 120),
+                                       embedded_color=True)
+            box = layer.getbbox()
+            if box:
+                layer = layer.crop(box)
+                layer.thumbnail((200, 200))
+                img.paste(layer, (cx - layer.width // 2, cy - layer.height // 2), layer)
+                drawn = True
+                break
+        except Exception:
+            continue
+    if not drawn:                                    # a star, if no emoji font is installed
+        pts = []
+        for i in range(10):
+            ang = -3.14159 / 2 + i * 3.14159 / 5
+            rad = 120 if i % 2 == 0 else 52
+            pts.append((cx + rad * math.cos(ang), cy + rad * math.sin(ang)))
+        d.polygon(pts, fill="#F6F0E4")
+    centered("BADGE EARNED", 625, font(34, True), "#8A7A55")
+    size = 78
+    while size > 44 and sum(d.textlength(w + " ", font=font(size, True)) for w in name.split()) > 1.9 * (W - 200):
+        size -= 6                                    # long names get a smaller font so they fit in two lines
+    y = wrapped(name, 675, font(size, True), "#2F4F3A", W - 200, int(size * 1.18))
+    y = wrapped(desc[0].upper() + desc[1:] if desc else "", y + 18, font(44), "#4A5A4E", W - 220, 56)
+    centered("Mindful Scroll  ·  pause first, then choose", H - 128, font(36, True), "#2F4F3A")
+    out = io.BytesIO()
+    img.save(out, format="PNG")
+    return out.getvalue()
+
+
+def share_badge_button(png, text, fname):
+    """Share the picture and message with the phone's share sheet; otherwise save the picture and copy the text."""
+    b64 = base64.b64encode(png).decode()
+    components.html("""<button id="sh" style="border:0;border-radius:999px;padding:.7rem 1.4rem;background:#2F4F3A;
+color:#F6F0E4;font:600 1rem sans-serif;cursor:pointer;width:100%">Share badge picture</button>
+<div id="m" style="font:.85rem sans-serif;color:#2F4F3A;margin-top:.5rem;text-align:center"></div>
+<script>
+const b64=%s, text=%s, fname=%s;
+function toFile(){const bin=atob(b64);const a=new Uint8Array(bin.length);
+  for(let i=0;i<bin.length;i++)a[i]=bin.charCodeAt(i);return new File([a],fname,{type:'image/png'});}
+document.getElementById('sh').onclick=async()=>{
+  const f=toFile(), m=document.getElementById('m');
+  try{ if(navigator.canShare && navigator.canShare({files:[f]})){
+         await navigator.share({files:[f],text:text}); m.textContent='Shared!'; return; } }
+  catch(e){ if(e && e.name==='AbortError') return; }
+  const url=URL.createObjectURL(f), a=document.createElement('a');
+  a.href=url; a.download=fname; document.body.appendChild(a); a.click(); a.remove();
+  try{ await navigator.clipboard.writeText(text); m.textContent='Picture saved and message copied. Paste them together anywhere.'; }
+  catch(e){ m.textContent='Picture saved. Copy the message above to send with it.'; }
+};
+</script>""" % (json.dumps(b64), json.dumps(text), json.dumps(fname)), height=100)
 
 
 def day_banner(day, learning):
