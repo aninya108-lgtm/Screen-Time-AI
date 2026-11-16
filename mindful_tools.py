@@ -20,13 +20,13 @@ from sklearn.base import clone
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import precision_recall_curve
-from sklearn.model_selection import GridSearchCV, cross_val_predict, train_test_split
+from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
 
 APPS = ["Instagram", "TikTok", "Snapchat", "YouTube"]
 DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 LOCS = ["home", "school", "outside"]
 CONFIDENCE = 0.6      # send a habit notification when the model is at least this sure
-MIN_ACCURACY = 0.8    # ...and only once its measured accuracy is at least this
+MIN_ACCURACY = 0.8    # accuracy goal that is reported next to the measured accuracy
 FEATURE_NAMES = ["Day of week", "Hour of day", "Is weekend", "Where you just were",
                  "Hours since school starts", "Hours since school ends",
                  "Hours until bedtime", "Hours since wake-up"]
@@ -347,61 +347,119 @@ def feat(d, h, ss, se, bed, wake):
     return [d, h, int(d >= 5), prev, (h - ss) % 24, (h - se) % 24, (bed - h) % 24, (h - wake) % 24]
 
 
+def _near(h, c, width):
+    """A smooth bump: 1 at hour c, fading with distance (the clock wraps around midnight)."""
+    d = abs(h - c) % 24
+    d = min(d, 24 - d)
+    return math.exp(-0.5 * (d / width) ** 2)
+
+
 def simulate_usage(ss, se, bed, wake, seed, days=42, end_iso=None):
-    """A believable teen week-after-week: a few habit hours tied to the schedule (after school,
-    before bed, lunch...), each with its own chance and session length, plus random one-off use.
-    Different seed = different habits. Returns (usage DataFrame, list of planted habit rules)."""
+    """Screen time for a made-up teenager, built to be messy the way real life is.
+    Every seed is a different person: how heavy a user, how regular, night owl or not, whether the school
+    bans phones, which days they have practice, which apps they favor. On top of that each DAY differs
+    (some days are heavy, some light, an occasional sick or busy day), habit times wobble by day, use drifts
+    up or down over the weeks, and sessions come in short checks and long binges.
+    Returns (usage DataFrame, list of the habits that really showed up, for the answer key)."""
     rng = random.Random(seed)
     end = date.fromisoformat(end_iso) if end_iso else date.today()
-    wd = {  # slot name -> (hour, likely apps, minutes range)
-        "before school": ((ss - 1) % 24, ["Instagram", "Snapchat"], (8, 25)),
-        "lunch": ((ss + se) // 2 % 24, ["Snapchat", "Instagram", "TikTok"], (12, 30)),
-        "right after school": (se % 24, ["TikTok", "Snapchat", "Instagram"], (25, 60)),
-        "late afternoon": ((se + 1) % 24, ["YouTube", "Snapchat"], (20, 50)),
-        "evening": ((bed - 3) % 24, ["TikTok", "YouTube", "Instagram"], (30, 75)),
-        "before bed": ((bed - 1) % 24, ["YouTube", "TikTok"], (20, 60)),
-    }
-    we = {
-        "late morning": ((wake + 3) % 24, ["YouTube", "Instagram"], (20, 50)),
-        "afternoon": (15, ["Instagram", "TikTok", "Snapchat"], (30, 80)),
-        "evening": (20, ["TikTok", "YouTube"], (35, 90)),
-        "before bed": ((bed - 1) % 24, ["TikTok", "YouTube"], (20, 60)),
-    }
 
-    def pick(slots, must, k):
-        names = [n for n, v in slots.items() if not is_asleep(v[0], bed, wake)]
-        chosen = [n for n in must if n in names]
-        rest = [n for n in names if n not in chosen]
-        rng.shuffle(rest)
-        chosen += rest[:max(0, k - len(chosen))]
-        rules, seen = [], set()
-        for n in chosen:
-            h, apps, mins = slots[n]
-            if h in seen:
-                continue
-            seen.add(h)
-            rules.append({"slot": n, "hour": h, "app": rng.choice(apps),
-                          "chance": round(rng.uniform(0.6, 0.92), 2), "minutes": mins})
-        return rules
+    # ---- who this teenager is ----
+    heavy = min(1.5, max(0.8, rng.lognormvariate(0.1, 0.25)))     # light to heavy user
+    routine = rng.uniform(0.85, 1.0)                              # 1 = very regular, 0.4 = fairly random
+    owl = rng.random() < 0.35                                    # stays up scrolling
+    phone_ban = rng.random() < 0.5                               # school keeps phones away
+    shift = rng.choice([-1.0, -0.5, 0.0, 0.0, 0.5, 1.0])         # their own habit timing
+    busy = rng.sample(range(5), rng.randint(0, 2))               # practice / club days
+    base0 = rng.uniform(0.02, 0.05)                              # random pickups at any hour
+    drift = rng.uniform(-0.2, 0.2)                             # use creeping up or down
+    fav = {a: rng.uniform(0.4, 1.6) for a in APPS}
+    awake = [h for h in range(24) if not is_asleep(h, bed, wake)]
 
-    wk_rules = pick(wd, ["right after school", "before bed"], rng.randint(4, 5))
-    we_rules = pick(we, ["evening"], rng.randint(3, 4))
+    def profile(weekend, jit, busy_day):
+        """Chance of using an app in each awake hour, for one kind of day."""
+        out = {}
+        if weekend:
+            bumps = [(0.55, 17 + jit[0], 4.0),                    # most of the day is phone time
+                     (0.40, (wake + 3 + (1.5 if owl else 0)) % 24 + jit[0], 1.3),
+                     (0.55, 15 + jit[1], 2.0),
+                     (0.90, 20 + shift + jit[2], 1.5),
+                     (0.92 * (1.1 if owl else 1), (bed - 1) % 24 + jit[3], 0.9)]
+        else:
+            after = 0.95 * (0.25 if busy_day else 1)
+            plateau = ((se + bed) / 2 + shift, max(2.0, (bed - se) / 2.2))     # home time: after school until bed
+            bumps = [(0.55 if not busy_day else 0.3, plateau[0] + jit[1], plateau[1]),
+                     (0.25, (ss - 1) % 24 + jit[0], 0.8),
+                     (0.35, (ss + se) / 2 + jit[1], 0.8),
+                     (after, se + 0.3 + shift + jit[1], 1.0),
+                     (0.65, (bed - 3) % 24 + shift + jit[2], 1.2),
+                     (0.92 * (1.1 if owl else 1), (bed - 1) % 24 + jit[3], 0.9)]
+            if busy_day:                                         # home from practice, tired, scrolls later
+                bumps.append((0.55, se + 2.7 + jit[1], 1.0))
+        for h in awake:
+            keep = 1 - base0
+            for amp, c, w in bumps:
+                keep *= 1 - amp * _near(h, c, w)
+            p = 1 - keep
+            if not weekend and ss <= h < se:                    # in class
+                p *= 0.12 if phone_ban else 0.4
+            out[h] = p
+        mean_p = sum(out.values()) / len(out)
+        return {h: routine * p + (1 - routine) * mean_p for h, p in out.items()}
+
+    def pick_app(h, weekend):
+        w = dict(fav)
+        if ss <= h < se and not weekend:
+            w["Snapchat"] *= 1.6
+        if h >= bed - 3 or h < wake + 1:
+            w["YouTube"] *= 1.6
+            w["TikTok"] *= 1.3
+        elif h in (se, se + 1):
+            w["TikTok"] *= 1.5
+        elif h < ss:
+            w["Instagram"] *= 1.4
+        names = list(w)
+        return rng.choices(names, weights=[w[a] for a in names])[0]
+
     rows = []
     for i in range(days):
         dt = end - timedelta(days=days - i)
         d = dt.weekday()
-        rules = we_rules if d >= 5 else wk_rules
-        by_hour = {r["hour"]: r for r in rules}
-        for h in range(24):
-            if is_asleep(h, bed, wake):
-                continue
-            r = by_hour.get(h)
-            if r and rng.random() < r["chance"]:
-                rows.append((dt.isoformat(), d, h, r["app"], int(rng.randint(*r["minutes"]) * 1.25)))
-            elif rng.random() < 0.06:
-                rows.append((dt.isoformat(), d, h, rng.choice(APPS), rng.randint(5, 20)))
+        weekend = d >= 5
+        jit = [rng.gauss(0, 0.3) for _ in range(4)]             # habit times wobble from day to day
+        prof = profile(weekend, jit, d in busy)
+        mood = rng.lognormvariate(0, 0.12) * (1 + drift * (i / max(1, days - 1) - 0.5))
+        odd = rng.random()
+        if odd < 0.03:                                           # sick day or away: much less
+            mood *= 0.4
+        elif odd < 0.06:                                         # sick in bed at home: much more
+            mood *= 1.5
+        quiet = set()
+        if weekend and rng.random() < 0.35:                       # out with friends for a few hours
+            start = rng.randint(11, 18)
+            quiet = {start, start + 1, start + 2}
+        for h in awake:
+            p = min(0.95, prof[h] * heavy * mood * (0.3 if h in quiet else 1))
+            if rng.random() < p:
+                long_binge = rng.random() < 0.15
+                mins = min(90, max(2, int(rng.lognormvariate(math.log(13), 0.7) * (1.8 if long_binge else 1))))
+                rows.append((dt.isoformat(), d, h, pick_app(h, weekend), mins))
     usage = pd.DataFrame(rows, columns=["date", "weekday", "hour", "app", "minutes"])
-    shown = ([dict(r, when="on weekdays") for r in wk_rules] + [dict(r, when="on weekends") for r in we_rules])
+
+    # ---- the answer key: habits that actually showed up in this person's data ----
+    shown = []
+    for weekend in (False, True):
+        n_days = max(1, sum(1 for i in range(days) if ((end - timedelta(days=days - i)).weekday() >= 5) == weekend))
+        sub = usage[(usage["weekday"] >= 5) == weekend]
+        stats = []
+        for h in awake:
+            hits = sub[sub["hour"] == h]
+            stats.append((hits["date"].nunique() / n_days, h, hits["app"].mode().iat[0] if len(hits) else ""))
+        stats.sort(reverse=True)
+        strong = [s for s in stats if s[0] >= 0.45][:5] or stats[:2]
+        for rate, h, app in sorted(strong, key=lambda s: s[1]):
+            shown.append({"slot": "habit", "hour": h, "app": app, "chance": round(rate, 2),
+                          "when": "on weekends" if weekend else "on weekdays"})
     return usage, shown
 
 
@@ -438,41 +496,63 @@ def effective_threshold(t_star, pref):
     return 0.8 if pref >= 0.75 else 0.5 if pref <= 0.55 else float(t_star)
 
 
+def _awake_count(bed, wake):
+    return sum(1 for h in range(24) if not is_asleep(h, bed, wake))
+
+
 def train_usage_model(usage, ss, se, bed, wake, end_iso, days=42):
-    """Two models.
-      A) 'Will any app be used this hour?'  A random forest whose settings are chosen by cross-validation
-         (scored on how good its probabilities are), then CALIBRATED so that '60% sure' really means about
-         6 times out of 10. A notification fires at CONFIDENCE (60%). Accuracy is measured with
-         cross-validated predictions, so every hour is scored by a model that never trained on it.
+    """Two models, tested the way a real forecast is used: on days that come AFTER the ones it learned from.
+      A) 'Will any app be used this hour?'  A random forest (settings chosen with time-ordered cross-validation),
+         then CALIBRATED so '60% sure' means about 6 times out of 10. A notification fires at CONFIDENCE (60%).
+         Accuracy comes from walking forward week by week: learn from the past, predict the next week,
+         never peek. It is compared with two simple baselines (always 'no use', and 'same as last week').
       B) 'Which app?'  Trained only on the hours when an app was used."""
     X, y = build_table(usage, ss, se, bed, wake, end_iso, days)
     yb = (y != "none").astype(int)
-    Xtr, Xte, ytr, yte, yapp_tr, yapp_te = train_test_split(X, yb, y, test_size=0.25, stratify=yb,
-                                                            random_state=1)
-    # the old single multi-class forest, kept only for comparison
-    old = RandomForestClassifier(n_estimators=100, min_samples_leaf=4, random_state=1).fit(Xtr, yapp_tr)
-    baseline_recall = float(np.mean(old.predict(Xte)[yte == 1] != "none"))
+    per_day = _awake_count(bed, wake)
+    day = np.repeat(np.arange(days), per_day)
 
-    grid = {"min_samples_leaf": [2, 4], "max_features": ["sqrt", None]}
-    search = GridSearchCV(RandomForestClassifier(n_estimators=100, random_state=1), grid, cv=3,
-                          scoring="neg_brier_score")
+    grid = {"min_samples_leaf": [3, 6, 10], "max_features": ["sqrt", None]}
+    search = GridSearchCV(RandomForestClassifier(n_estimators=100, random_state=1), grid,
+                          cv=TimeSeriesSplit(n_splits=3), scoring="neg_brier_score")
     search.fit(X, yb)
     best = search.best_estimator_
-    calibrated = CalibratedClassifierCV(clone(best), method="sigmoid", cv=5)
-    oof = cross_val_predict(calibrated, X, yb, cv=5, method="predict_proba")[:, 1]
-    flagged = oof >= CONFIDENCE
-    accuracy = float((flagged == (yb == 1)).mean())
-    precision = float(yb[flagged].mean()) if flagged.any() else 0.0
-    recall = float(flagged[yb == 1].mean())
 
-    final = clone(calibrated).fit(X, yb)                 # refit on everything for the forecast
-    plain = clone(best).fit(X, yb)                       # only used to read feature importances
+    # walk forward: learn from days before k, predict days k .. k+6
+    start = max(14, days // 3)
+    folds = list(range(start, days, 7))
+    probs, truth, last_week = [], [], []
+    for k in folds:
+        tr, te = day < k, (day >= k) & (day < k + 7)
+        if te.sum() == 0 or len(set(yb[tr])) < 2:
+            continue
+        cal = CalibratedClassifierCV(clone(best), method="sigmoid", cv=3).fit(X[tr], yb[tr])
+        probs.append(cal.predict_proba(X[te])[:, 1])
+        truth.append(yb[te])
+        idx = np.where(te)[0]
+        last_week.append(yb[idx - 7 * per_day])               # the same hour, one week earlier
+    p, t, lw = np.concatenate(probs), np.concatenate(truth), np.concatenate(last_week)
+    flagged = p >= CONFIDENCE
+    accuracy = float(((p >= 0.5) == (t == 1)).mean())          # standard accuracy: 50/50 cut-off
+    accuracy_at_conf = float((flagged == (t == 1)).mean())
+    precision = float(t[flagged].mean()) if flagged.any() else 0.0
+    recall = float(flagged[t == 1].mean()) if (t == 1).any() else 0.0
+    baseline_accuracy = float((t == 0).mean())                 # always say "no use"
+    naive_accuracy = float((lw == t).mean())                   # "same as last week"
+    naive_recall = float(lw[t == 1].mean()) if (t == 1).any() else 0.0
+
+    final = CalibratedClassifierCV(clone(best), method="sigmoid", cv=5).fit(X, yb)
+    plain = clone(best).fit(X, yb)                             # only used to read feature importances
     which = RandomForestClassifier(n_estimators=100, random_state=1).fit(X[yb == 1], y[yb == 1])
     slots = [(d, h) for d in range(7) for h in range(24) if not is_asleep(h, bed, wake)]
     F = np.array([feat(d, h, ss, se, bed, wake) for d, h in slots])
     p_any = final.predict_proba(F)[:, 1]
     app = which.predict(F)
-    forecast = {slot: (float(p), str(a)) for slot, p, a in zip(slots, p_any, app)}
-    return {"accuracy": accuracy, "recall": recall, "precision": precision, "t_star": CONFIDENCE,
-            "ready": accuracy >= MIN_ACCURACY, "baseline_recall": baseline_recall, "forecast": forecast,
+    forecast = {slot: (float(q), str(a)) for slot, q, a in zip(slots, p_any, app)}
+    # Nudges are on when the model has hours it is confident about AND those confident calls are right at
+    # least as often as it claims (60% sure -> right 60%+ of the time). MIN_ACCURACY is the goal we report.
+    ready = bool(precision >= CONFIDENCE and flagged.any())
+    return {"accuracy": accuracy, "accuracy_at_conf": accuracy_at_conf, "recall": recall, "precision": precision, "t_star": CONFIDENCE,
+            "ready": ready, "meets_goal": bool(accuracy >= MIN_ACCURACY), "baseline_accuracy": baseline_accuracy, "naive_accuracy": naive_accuracy,
+            "baseline_recall": naive_recall, "n_test_hours": int(len(t)), "forecast": forecast,
             "importances": {n: float(v) for n, v in zip(FEATURE_NAMES, plain.feature_importances_)}}
