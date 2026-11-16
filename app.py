@@ -1255,7 +1255,7 @@ def model_report(rep):
            f"and caught {rep['recall']:.0%} of the hours an app was really used. ")
     if not rep["ready"]:
         return txt + "It has no hours it is confident enough about, so it keeps to wake-up and bedtime check-ins."
-    return txt + ("Habit notifications are on." if rep["meets_goal"] else
+    return txt + ("Habit notifications are on." if rep.get("meets_goal", rep["accuracy"] >= mt.MIN_ACCURACY) else
                   "Habit notifications are on, but overall accuracy is below the goal, so treat them as gentle nudges.")
 
 
@@ -1608,7 +1608,7 @@ def share_badge_button(png, text, fname):
 color:#F6F0E4;font:600 1rem sans-serif;cursor:pointer;width:100%">Share badge picture</button>
 <div id="m" style="font:.85rem sans-serif;color:#2F4F3A;margin-top:.5rem;text-align:center"></div>
 <script>
-const b64=%s, text=%s, fname=%s;
+const b64=__B64__, text=__TEXT__, fname=__FNAME__;
 function toFile(){const bin=atob(b64);const a=new Uint8Array(bin.length);
   for(let i=0;i<bin.length;i++)a[i]=bin.charCodeAt(i);return new File([a],fname,{type:'image/png'});}
 document.getElementById('sh').onclick=async()=>{
@@ -1621,7 +1621,8 @@ document.getElementById('sh').onclick=async()=>{
   try{ await navigator.clipboard.writeText(text); m.textContent='Picture saved and message copied. Paste them together anywhere.'; }
   catch(e){ m.textContent='Picture saved. Copy the message above to send with it.'; }
 };
-</script>""" % (json.dumps(b64), json.dumps(text), json.dumps(fname)), height=100)
+</script>""".replace("__B64__", json.dumps(b64)).replace("__TEXT__", json.dumps(text))
+                    .replace("__FNAME__", json.dumps(fname)), height=100)
 
 
 def day_banner(day, learning):
